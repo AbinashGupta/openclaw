@@ -1,0 +1,64 @@
+# Local Dockerfile extending OpenClaw with Whisper support
+# This file is not tracked by the upstream repo and won't conflict with git pull
+
+FROM ghcr.io/openclaw/openclaw:2026.2.15
+
+# Switch to root to install packages
+USER root
+
+# Skills section: Install audio processing and AI capabilities
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      ffmpeg \
+      python3-pip \
+      git && \
+    pip3 install --break-system-packages --no-cache-dir -U openai-whisper && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
+
+# Clone task-manager repository
+RUN git clone https://github.com/AbinashGupta/task-manager.git /app/task-manager
+
+# Ensure node and npm are available (should be from base image, but verify and install if needed)
+RUN if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then \
+      apt-get update && \
+      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends nodejs npm && \
+      apt-get clean && \
+      rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*; \
+    fi
+
+# Install task-manager dependencies and build (as root, then fix permissions)
+WORKDIR /app/task-manager
+# Install all dependencies including devDependencies (needed for build)
+# Unset NODE_ENV if it's set to production to ensure devDependencies are installed
+RUN NODE_ENV=development npm install && npm run build
+
+# Fix ownership of task-manager directory for node user
+RUN chown -R node:node /app/task-manager
+
+# Reset WORKDIR so container starts in /app (gateway expects this)
+WORKDIR /app
+
+# Create startup script to run both services
+# task-manager must bind to 0.0.0.0 to be reachable from host; gateway runs from /app
+RUN printf '%s\n' \
+  '#!/bin/sh' \
+  'set -e' \
+  '# Start task-manager in background, bind to 0.0.0.0 so host can access' \
+  'cd /app/task-manager && node node_modules/.bin/next start -H 0.0.0.0 -p 3847 &' \
+  'sleep 3' \
+  '# Run gateway from /app (docker-compose command or default)' \
+  'cd /app' \
+  'if [ $# -eq 0 ]; then' \
+  '  exec node /app/dist/index.js gateway --allow-unconfigured' \
+  'else' \
+  '  shift 2' \
+  '  exec node /app/dist/index.js "$@"' \
+  'fi' \
+  > /app/start.sh && chmod +x /app/start.sh && chown node:node /app/start.sh
+
+# Switch back to non-root user for security
+USER node
+
+# Use ENTRYPOINT so task-manager always starts, even when command is overridden
+ENTRYPOINT ["/app/start.sh"]

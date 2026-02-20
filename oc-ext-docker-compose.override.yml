@@ -1,0 +1,12 @@
+# Local overrides (gitignored). Automatically merged by Docker Compose with docker-compose.yml.
+# Start from Docker Desktop or: docker compose up -d
+# Uses openclaw:local-whisper and exposes task-manager on port 3847.
+# Persists task-manager data (e.g. tasks.csv) on the host under OPENCLAW_CONFIG_DIR/task-manager-data.
+
+services:
+  openclaw-gateway:
+    image: openclaw:local-whisper
+    ports:
+      - "3847:3847"
+    volumes:
+      - ${OPENCLAW_CONFIG_DIR}/task-manager-data:/app/task-manager/data
