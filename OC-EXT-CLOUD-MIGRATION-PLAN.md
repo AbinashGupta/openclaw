@@ -63,10 +63,10 @@ graph TB
 
 #### 3. **Git-Pull-On-Start Mechanism**
 - Container restart triggers automatic `git pull` for all repos in `/myapps/*`
-- No image rebuild needed for code updates
-- Optional `SKIP_BUILD` flag (default: `true`)
-  - `SKIP_BUILD=true`: Only pull, use existing build artifacts (fast restart)
-  - `SKIP_BUILD=false`: Pull + npm install + npm build (full refresh)
+- **On Cloud (runtime)**: `SKIP_BUILD=true` (default) - only pulls code, uses pre-built artifacts from image
+- **On Local (development)**: Can use `SKIP_BUILD=false` to rebuild after pulling
+- **Important**: If code changes require rebuild, rebuild image locally → push to registry → pull on cloud
+- This keeps cloud runtime-only (no build tools needed)
 
 #### 4. **Multi-Service Orchestration**
 - Single container runs multiple services:
@@ -93,8 +93,9 @@ The framework is **platform-agnostic**:
 
 2. **Start Time** (`oc-ext-entrypoint.sh`):
    - Loops through `/myapps/*` directories
-   - Runs `git pull --ff-only` in each repo
-   - Optionally runs `npm install` && `npm run build` if `SKIP_BUILD=false`
+   - Runs `git pull --ff-only` in each repo (updates code)
+   - **On Cloud**: `SKIP_BUILD=true` (default) - uses pre-built artifacts from image
+   - **On Local**: Can set `SKIP_BUILD=false` to rebuild after pulling
    - Delegates to `/app/start.sh`
 
 3. **Runtime** (`/app/start.sh`):
@@ -119,6 +120,26 @@ Moving from **local machine** to **AWS EC2** with:
 - Infrastructure as Code (AWS CDK)
 - Bidirectional data synchronization between local and cloud
 - Seamless switching between local and cloud deployments
+
+### Critical Clarification: Development vs Runtime
+
+**IMPORTANT**: This plan assumes:
+- **All development happens locally** (coding, building, testing)
+- **Cloud is runtime-only** (just runs the agent 24/7 when your local machine is off)
+
+**What this means:**
+- ✅ Build Docker image **locally** → push to registry → pull on EC2
+- ✅ Develop code **locally** → push to GitHub → cloud auto-pulls on restart
+- ✅ Test **locally** before deploying
+- ❌ **NO** building on EC2 (no build tools needed)
+- ❌ **NO** development on EC2 (no IDE, no git commits from cloud)
+- ❌ **NO** full repo clone on EC2 (just docker-compose.yml and oc-ext-* files)
+
+**Workflow:**
+1. Develop locally → build image locally → push to registry
+2. EC2 pulls image from registry → runs agent
+3. Code updates: push to GitHub → restart EC2 → auto-pulls latest (via git-pull-on-start)
+4. Only rebuild image when adding new apps to `/myapps/` or changing Dockerfile
 
 ### Architecture: Hybrid Local-Cloud Setup
 
@@ -159,9 +180,19 @@ graph TB
 ### Use Cases
 
 1. **Normal Operation**: Use local agent (local machine always on)
+   - **Development**: All code changes happen locally
+   - **Testing**: Test locally before deploying
+   
 2. **Vacation Mode**: Sync local → cloud, use cloud agent (local machine off)
+   - **Runtime Only**: Cloud runs pre-built image, pulls latest code on restart
+   - **No Development**: No coding/building on cloud
+   
 3. **Return from Vacation**: Sync cloud → local, resume local agent
+   - **Development Resumes**: Back to local development
+   
 4. **Backup**: Continuous sync to S3 for disaster recovery
+
+**Key Principle**: Cloud = Runtime Only. All development, building, and testing happens locally.
 
 ### Critical Requirement: Session Continuity
 
@@ -250,24 +281,31 @@ graph TB
 
 #### 4. **Docker Image**
 
+**Important**: All development happens **locally**. Cloud is **runtime-only**.
+
 **Current setup:**
 - Image built locally: `openclaw:local-whisper`
 - Built from `OC-EXT-Dockerfile.local`
 
 **Migration approach:**
-- **Option A**: Build on cloud VM
-  - Clone openclaw repo to cloud VM
-  - Run: `docker build -t openclaw:local-whisper -f OC-EXT-Dockerfile.local .`
-  - Rebuild when you add new apps
+- **Build locally** (where you develop):
+  - Build: `docker build -t openclaw:local-whisper -f OC-EXT-Dockerfile.local .`
+  - Push to registry: `docker push your-registry/openclaw:local-whisper`
+  - Use Docker Hub, GitHub Container Registry, or AWS ECR
   
-- **Option B**: Use container registry (recommended for multi-VM)
-  - Push to Docker Hub, GitHub Container Registry, or cloud registry (ECR/GCR/ACR)
-  - Pull on cloud VM: `docker pull your-registry/openclaw:local-whisper`
-  - Faster deployment, consistent across VMs
+- **Pull on cloud VM** (runtime only):
+  - Pull: `docker pull your-registry/openclaw:local-whisper`
+  - No build tools needed on EC2
+  - No repo clone needed on EC2 (just pull the image)
+
+**Code updates workflow:**
+- Develop locally → Push to GitHub → Cloud agent restarts → Auto-pulls latest code (via `oc-ext-entrypoint.sh`)
+- No rebuild needed for code changes (git pull handles it)
+- Only rebuild image when adding new apps to `/myapps/` or changing Dockerfile
 
 **Action items:**
-- Build image on cloud VM **or** push to registry
-- Update `OPENCLAW_IMAGE` in cloud `.env` if using registry
+- Build image locally and push to registry
+- Update `OPENCLAW_IMAGE` in cloud `.env` to use registry image
 
 #### 5. **Network & Firewall Configuration**
 
@@ -547,6 +585,8 @@ export class OpenClawStack extends cdk.Stack {
     });
 
     // User data script (runs on first boot)
+    // Note: Only installs runtime tools (Docker, AWS CLI, git for code pulls)
+    // NO build tools (npm/node) - image is built locally and pulled from registry
     instance.userData.addCommands(
       '#!/bin/bash',
       'set -e',
@@ -1082,11 +1122,25 @@ find ~/.openclaw -name "*.jsonl" -mtime -1
 
 ### Phase 1: Local Preparation
 
+**Note**: All development happens locally. Cloud is runtime-only.
+
 - [ ] **Verify current local setup works**
   ```bash
   docker compose up -d
   docker logs openclaw-gateway
   curl http://localhost:18789/health
+  ```
+
+- [ ] **Build Docker image locally** (where you develop)
+  ```bash
+  # On local machine
+  cd /path/to/openclaw
+  docker build -t your-dockerhub-username/openclaw:local-whisper -f OC-EXT-Dockerfile.local .
+  
+  # Push to registry (Docker Hub, GitHub Container Registry, or AWS ECR)
+  docker push your-dockerhub-username/openclaw:local-whisper
+  
+  # Note: This image will be pulled on EC2 - no building on cloud!
   ```
 
 - [ ] **Install AWS CLI and CDK**
@@ -1216,14 +1270,34 @@ find ~/.openclaw -name "*.jsonl" -mtime -1
   # AWS credentials are auto-configured via IAM instance role (no manual config needed)
   ```
 
-- [ ] **Clone OpenClaw repo on EC2**
+- [ ] **Pull Docker image from registry** (NOT building on EC2)
   ```bash
   # On EC2
-  cd /opt
-  sudo git clone https://github.com/openclaw/openclaw.git
-  sudo chown -R ubuntu:ubuntu /opt/openclaw
+  # First, build and push image from LOCAL machine:
+  # (On local machine)
+  docker build -t your-dockerhub-username/openclaw:local-whisper -f OC-EXT-Dockerfile.local .
+  docker push your-dockerhub-username/openclaw:local-whisper
+  
+  # Then pull on EC2:
+  # (On EC2)
+  docker pull your-dockerhub-username/openclaw:local-whisper
+  docker tag your-dockerhub-username/openclaw:local-whisper openclaw:local-whisper
+  ```
+
+- [ ] **Create minimal OpenClaw directory on EC2** (for docker-compose.yml only)
+  ```bash
+  # On EC2
+  mkdir -p /opt/openclaw
   cd /opt/openclaw
-  git checkout develop  # or your custom branch
+  
+  # Clone ONLY to get docker-compose.yml and oc-ext-* files
+  # (We don't need the full repo, just compose configs)
+  git clone --depth 1 https://github.com/openclaw/openclaw.git /tmp/openclaw-temp
+  cp /tmp/openclaw-temp/docker-compose.yml .
+  cp /tmp/openclaw-temp/oc-ext-*.yml .
+  cp /tmp/openclaw-temp/oc-ext-*.sh .
+  rm -rf /tmp/openclaw-temp
+  sudo chown -R ubuntu:ubuntu /opt/openclaw
   ```
 
 - [ ] **Create sync scripts on EC2**
@@ -1266,13 +1340,14 @@ find ~/.openclaw -name "*.jsonl" -mtime -1
   chmod 600 .env
   ```
 
-- [ ] **Build Docker image on EC2**
+- [ ] **Verify Docker image is available**
   ```bash
   # On EC2
-  cd /opt/openclaw
-  docker build -t openclaw:local-whisper -f OC-EXT-Dockerfile.local .
+  docker images | grep openclaw:local-whisper
+  # Should show the image you pulled from registry
   
-  # This will take 10-15 minutes (installs whisper, clones task-manager, builds)
+  # Note: Image was built locally and pushed to registry.
+  # EC2 only pulls and runs it - no build tools needed!
   ```
 
 ### Phase 4: Initial Data Sync (Local → Cloud)
@@ -1438,11 +1513,13 @@ find ~/.openclaw -name "*.jsonl" -mtime -1
 
 ## Key Advantages of Your Framework
 
-1. **Update without rebuild**: Push code to GitHub → restart container → auto-pulls latest
-2. **Platform portability**: Same setup works on local, cloud, Raspberry Pi
-3. **No upstream conflicts**: `oc-ext-` prefix keeps your changes separate
-4. **Multi-app support**: Add more apps by cloning into `/myapps/`
-5. **Flexible build strategy**: `SKIP_BUILD=true` for fast restarts, `false` for full refresh
+1. **Development stays local**: Code, build, test all on your machine
+2. **Cloud is runtime-only**: No build tools, no repo clone needed on EC2
+3. **Code updates without rebuild**: Push to GitHub → restart container → auto-pulls latest (via git-pull-on-start)
+4. **Image updates**: Rebuild locally → push to registry → pull on EC2 (only when adding apps or changing Dockerfile)
+5. **Platform portability**: Same setup works on local, cloud, Raspberry Pi
+6. **No upstream conflicts**: `oc-ext-` prefix keeps your changes separate
+7. **Multi-app support**: Add more apps by cloning into `/myapps/` (in Dockerfile, built locally)
 
 ---
 
@@ -1673,27 +1750,34 @@ find "$CONFIG_DIR" -name "*.lock" -delete
 
 ### Immediate Actions (This Week)
 
-1. **Set up AWS account** (if not already)
+1. **Build and push Docker image locally**
+   ```bash
+   # On local machine (where you develop)
+   docker build -t your-dockerhub-username/openclaw:local-whisper -f OC-EXT-Dockerfile.local .
+   docker push your-dockerhub-username/openclaw:local-whisper
+   ```
+
+2. **Set up AWS account** (if not already)
    - Enable MFA for root account
    - Create IAM user with admin access for CDK
    - Configure AWS CLI: `aws configure`
 
-2. **Create CDK project**
+3. **Create CDK project**
    - Follow Phase 2 of migration checklist
    - Define infrastructure (EC2, S3, Secrets Manager)
    - Deploy: `cdk deploy`
 
-3. **Set up sync scripts**
+4. **Set up sync scripts**
    - Create local sync scripts
    - Test sync to S3
    - Verify S3 bucket permissions
 
 ### Short-term (Next 2 Weeks)
 
-4. **Deploy to EC2**
+4. **Deploy to EC2** (runtime setup only)
    - SSH to EC2, install Docker
-   - Clone OpenClaw repo
-   - Build Docker image
+   - Pull Docker image from registry (no building!)
+   - Copy docker-compose.yml and oc-ext-* files
    - Sync data from S3
    - Start services
 
@@ -1701,17 +1785,25 @@ find "$CONFIG_DIR" -name "*.lock" -delete
    - Test local → cloud sync
    - Test cloud → local sync
    - Verify no data loss
+   - Test code updates: push to GitHub → restart cloud → auto-pulls
    - Document any issues
 
 ### Long-term (Ongoing)
 
-6. **Establish routine**
-   - Before vacation: `sync-to-cloud.sh` → start EC2
+6. **Development workflow** (all local)
+   - Develop code locally
+   - Test locally
+   - Push to GitHub
+   - Cloud auto-pulls on restart (no rebuild needed)
+   - Only rebuild image when adding new apps to `/myapps/` or changing Dockerfile
+
+7. **Establish routine**
+   - Before vacation: Build image locally → push to registry → `sync-to-cloud.sh` → start EC2
    - After vacation: `sync-from-cloud.sh` → stop EC2
    - Weekly: Review S3 backups
    - Monthly: Review AWS costs
 
-7. **Optimize and iterate**
+8. **Optimize and iterate**
    - Monitor performance (EC2 instance size)
    - Adjust backup frequency
    - Add monitoring/alerting if needed
@@ -2040,13 +2132,12 @@ aws s3 sync "s3://openclaw-data-sync-123456789/backups/$BACKUP_DATE/openclaw-con
 aws s3 sync "s3://openclaw-data-sync-123456789/openclaw-config/" ~/.openclaw/
 aws s3 sync "s3://openclaw-data-sync-123456789/task-manager-data/" ~/task-manager-data/
 
-# 4. Clone OpenClaw repo
-git clone https://github.com/openclaw/openclaw.git
-cd openclaw
-git checkout develop
+# 4. Pull Docker image from registry (or rebuild locally if needed)
+docker pull your-dockerhub-username/openclaw:local-whisper
+docker tag your-dockerhub-username/openclaw:local-whisper openclaw:local-whisper
 
-# 5. Rebuild Docker image
-docker build -t openclaw:local-whisper -f OC-EXT-Dockerfile.local .
+# Or rebuild locally if registry unavailable:
+# docker build -t openclaw:local-whisper -f OC-EXT-Dockerfile.local .
 
 # 6. Create .env file (fetch secrets from AWS Secrets Manager)
 # ... (see migration checklist)
