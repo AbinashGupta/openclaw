@@ -1,0 +1,36 @@
+# OpenClaw Extension Files Convention
+
+## File Naming Convention
+
+All custom/extension files that are not part of the upstream openclaw repo must be prefixed with:
+- **`oc-ext-`** for lowercase filenames (e.g., `oc-ext-docker-compose.override.yml`, `oc-ext-entrypoint.sh`)
+- **`OC-EXT-`** for uppercase filenames (e.g., `OC-EXT-Dockerfile.local`, `OC-EXT-DOCKER-LOCAL.md`)
+
+## Rules
+
+1. **Only modify files with `oc-ext-` or `OC-EXT-` prefix** - Never modify existing openclaw files without this prefix.
+2. **All new custom files must use the prefix** - Any new files you add should follow the naming convention.
+3. **Branch strategy** - Keep customizations in a `develop` branch (or your custom branch) to avoid conflicts when pulling from upstream.
+4. **Purpose** - This convention allows you to:
+   - Pull latest openclaw changes without conflicts
+   - Clearly identify which files are your customizations
+   - Maintain a clean separation between upstream and custom code
+
+## Examples
+
+✅ **Good:**
+- `OC-EXT-Dockerfile.local`
+- `oc-ext-docker-compose.override.yml`
+- `oc-ext-entrypoint.sh`
+- `OC-EXT-README.md`
+
+❌ **Bad:**
+- `Dockerfile.local` (conflicts with upstream)
+- `docker-compose.override.yml` (might conflict)
+- `entrypoint.sh` (not clearly marked as custom)
+
+## When Working on This Repo
+
+- Always check if a file has the `oc-ext-`/`OC-EXT-` prefix before modifying it
+- If you need to add functionality, create new files with the prefix rather than modifying upstream files
+- When pulling from upstream, your `oc-ext-` files will remain untouched
