@@ -61,12 +61,13 @@ graph TB
   - `/myapps/task-manager`: Task management Next.js app
   - Future apps can be added by cloning into `/myapps/`
 
-#### 3. **Git-Pull-On-Start Mechanism**
-- Container restart triggers automatic `git pull` for all repos in `/myapps/*`
-- **On Cloud (runtime)**: `SKIP_BUILD=true` (default) - only pulls code, uses pre-built artifacts from image
+#### 3. **Git-Pull-On-Start Mechanism (Scoped)**
+- Container restart triggers `git pull` for repos in `/myapps/*`
+- **On Cloud (built apps, e.g. task-manager)**: `SKIP_BUILD=true` (default) — git pull is informational only; pre-built artifacts from image are used. Runtime does **not** rebuild.
+- **On Cloud (script/config-only repos)**: auto-pull at startup is acceptable since there is no build step
 - **On Local (development)**: Can use `SKIP_BUILD=false` to rebuild after pulling
-- **Important**: If code changes require rebuild, rebuild image locally → push to registry → pull on cloud
-- This keeps cloud runtime-only (no build tools needed)
+- **For code changes that require a rebuild**: rebuild image locally → push to registry → pull on cloud. Do not rely on git pull to update built artifacts at runtime.
+- This keeps cloud runtime-only (no build tools needed) and image version = code version for built apps
 
 #### 4. **Multi-Service Orchestration**
 - Single container runs multiple services:
@@ -112,14 +113,26 @@ The framework is **platform-agnostic**:
 
 ---
 
-## Part 2: AWS Cloud Migration Plan with Data Sync
+## Part 2: AWS Cloud Migration Plan with State Handoff
+
+### v1 Focus (Three Concerns Only)
+
+The v1 migration plan focuses on exactly three things. Everything else is a future enhancement.
+
+1. **Stop safely** — quiesce the source runtime cleanly, no active writes
+2. **Move state safely** — snapshot → copy → verify checksums/file counts
+3. **Start safely** — version compatibility check + health/smoke test at destination
+
+Anything beyond these three is explicitly deferred.
+
+---
 
 ### Migration Scope
 
 Moving from **local machine** to **AWS EC2** with:
 - Infrastructure as Code (AWS CDK)
-- Bidirectional data synchronization between local and cloud
-- Seamless switching between local and cloud deployments
+- **Controlled state handoff** between local and cloud (single active runtime at all times)
+- **Scripted switching workflow** with transition window and session continuity guarantees
 
 ### Critical Clarification: Development vs Runtime
 
@@ -138,8 +151,51 @@ Moving from **local machine** to **AWS EC2** with:
 **Workflow:**
 1. Develop locally → build image locally → push to registry
 2. EC2 pulls image from registry → runs agent
-3. Code updates: push to GitHub → restart EC2 → auto-pulls latest (via git-pull-on-start)
-4. Only rebuild image when adding new apps to `/myapps/` or changing Dockerfile
+3. Code updates: push to GitHub → restart EC2 → auto-pulls latest (non-built/script repos only)
+4. Only rebuild image when adding new apps to `/myapps/`, changing Dockerfile, or changing build output
+
+---
+
+### Operating Model (Hard Constraints — v1 Invariants)
+
+These are top-level invariants, not optional guidelines. The entire switching workflow is designed around these rules.
+
+| Constraint | Rule |
+|---|---|
+| **Single active runtime** | Never run local and cloud agents simultaneously — ever |
+| **Both-down transition window** | State transfer only happens when both runtimes are stopped |
+| **Switch only via script** | No manual start/stop sequences during transitions |
+| **Abort on uncertainty** | Fail closed; do not continue "best effort" if preflight fails |
+| **No conflict merge in v1** | Abort if unexpected destination changes are detected |
+| **Handoff-based, not continuous** | State transfer is a one-time copy during the switch, not ongoing sync |
+
+> **State transfer model**: controlled handoff from active runtime → next runtime, never concurrent writers.
+
+---
+
+### Architectural Position Alignment
+
+This section captures the agreed architectural position that the migration plan must stay consistent with.
+
+#### Current Position (Must Remain True)
+
+- **OpenClaw remains upstream and untouched** — the system uses a wrapper/extension layer (`oc-ext-*`, `/myapps`, scripts) and never modifies OpenClaw internals
+- **Do not fork OpenClaw now** — stay upstream-compatible; learn from real usage before taking ownership of deeper complexity
+- **Extension-only strategy** — all custom logic lives outside OpenClaw internals to preserve upgradeability and future migration flexibility
+- **Postpone DB-backed architecture** — remain file-based until real concurrency/workflow pain justifies migration
+- **File storage is acceptable for current stage** because of the single-agent + single-writer + local/cloud switching model
+- **Fork only on real friction** — trigger points: DB need, multi-agent concurrency, file-system limits, missing lifecycle controls
+- **Conceptual model**: Manthan (system vision) uses OpenClaw (runtime engine) — maintain this separation for future evolution
+- **Protect future optionality** — avoid tight coupling to internal file structures; keep new logic in the extension layer
+
+#### What This Means for the Migration Plan
+
+- The migration plan must not introduce complexity that creates tight coupling to OpenClaw internals
+- No pluggable sync engines, orchestration frameworks, or migration dashboards in v1
+- A single script + clear documented process is sufficient
+- Mark any beyond-v1 ideas explicitly as **future enhancements**
+
+---
 
 ### Architecture: Hybrid Local-Cloud Setup
 
@@ -155,23 +211,23 @@ graph TB
         ec2["EC2 Instance<br/>Ubuntu 22.04"]
         cloudAgent["OpenClaw Agent<br/>openclaw:local-whisper"]
         ebs["EBS Volume<br/>Persistent Storage"]
-        s3["S3 Bucket<br/>Backup & Sync"]
+        s3["S3 Bucket<br/>State Handoff & Backup"]
         secretsManager["AWS Secrets Manager<br/>API Keys & Tokens"]
     end
     
-    subgraph sync [Data Synchronization]
-        syncScript["Sync Script<br/>rsync + aws s3 sync"]
-        direction["Local → Cloud<br/>Cloud → Local"]
+    subgraph handoff [State Handoff - One Direction at a Time]
+        switchScript["Switch Script<br/>stop → snapshot → copy → verify → start"]
+        note["Single active runtime only<br/>Both runtimes down during transfer"]
     end
     
-    localData -->|"Push to Cloud"| syncScript
-    syncScript --> s3
+    localData -->|"Handoff: Local→Cloud"| switchScript
+    switchScript --> s3
     s3 --> ebs
     ebs --> cloudAgent
     
-    cloudAgent -->|"Pull to Local"| s3
-    s3 --> syncScript
-    syncScript --> localData
+    cloudAgent -->|"Handoff: Cloud→Local"| s3
+    s3 --> switchScript
+    switchScript --> localData
     
     localEnv -.->|"CDK Deploy"| secretsManager
     secretsManager -.-> cloudAgent
@@ -193,6 +249,87 @@ graph TB
 4. **Backup**: Continuous sync to S3 for disaster recovery
 
 **Key Principle**: Cloud = Runtime Only. All development, building, and testing happens locally.
+
+### Switch Workflow (v1 Sequence)
+
+Every switch between local and cloud follows this exact sequence. Deviating from it — including manually starting or stopping either side during the transition — is not supported.
+
+```
+1. Preflight checks
+   ├── Confirm source runtime is fully stopped (no running containers)
+   ├── Confirm destination is not running
+   ├── Check destination has compatible image/app version
+   └── Check disk space / S3 connectivity
+
+2. Graceful stop + quiesce source
+   ├── docker compose stop (source)
+   ├── Wait for clean shutdown (no active writes)
+   └── Delete stale lock files
+
+3. Snapshot / manifest creation
+   ├── Record source: image tag, app version, extension versions, timestamp
+   ├── Create timestamped archive of state directories
+   └── Write manifest file alongside snapshot
+
+4. Copy state to destination (via S3)
+   ├── aws s3 sync (source → S3)
+   └── aws s3 sync (S3 → destination)
+
+5. Verify checksums / file counts
+   ├── Compare file counts and sizes
+   ├── Verify manifest matches transferred state
+   └── ABORT if mismatch detected — do not start destination
+
+6. Start destination runtime
+   ├── Confirm version compatibility (image tag matches manifest)
+   └── docker compose up -d (destination)
+
+7. Health check + smoke test
+   ├── curl /health endpoint
+   ├── Confirm services responding
+   └── ABORT + rollback to previous snapshot if health check fails
+
+8. Write active-runtime marker
+   └── Record which runtime is now active (local or cloud) + timestamp
+```
+
+**Abort behaviour**: at any step, if a check fails, the script exits non-zero, leaves the destination stopped, and preserves the source snapshot for rollback.
+
+**Rollback**: restore previous snapshot (last N retained) and start source again.
+
+### Version Compatibility & Deployment Discipline
+
+#### Image Version = Code Version (Preferred Model)
+
+For built artifacts (Next.js apps, compiled code):
+- **Image tag defines the code version** — no runtime code mutation
+- Rebuild trigger events: dependency changes, Dockerfile changes, new `/myapps` entries, build output changes
+- Primary deployment path: `build locally → push to registry → pull on cloud`
+
+#### Runtime Auto-Pull (Scoped Rule)
+
+- **Built apps** (`task-manager`, Next.js): `SKIP_BUILD=true` on cloud — image already contains build output; git pull at startup is **informational only** (does not rebuild)
+- **Script/config repos** (non-built): auto-pull at startup is acceptable
+- **Do not mutate built artifacts at runtime** — if new code requires a rebuild, that means a new image build and push cycle, not a runtime git pull
+
+#### Switch Manifest (Required)
+
+Every switch must record a manifest file alongside the snapshot:
+```json
+{
+  "switched_at": "2026-02-21T10:00:00Z",
+  "direction": "local-to-cloud",
+  "image_tag": "your-registry/openclaw:20260221-abc1234",
+  "app_versions": {
+    "task-manager": "git-sha-here"
+  },
+  "extension_versions": {},
+  "state_file_count": 142,
+  "snapshot_path": "s3://openclaw-data-sync-xxx/backups/2026-02-21-100000/"
+}
+```
+
+Destination runtime startup is **blocked** if the running image tag does not match the manifest.
 
 ### Critical Requirement: Session Continuity
 
@@ -415,10 +552,10 @@ graph TB
   - Inbound: SSH (22), OpenClaw Gateway (18789), Task Manager (3847) from your IP(s)
   - Outbound: All traffic (for git pull, npm install, API calls)
 
-#### 2. **S3 Bucket** (Data Sync & Backup)
+#### 2. **S3 Bucket** (State Handoff Transit & Backup)
 - **Purpose**: 
-  - Bidirectional sync between local and cloud
-  - Automated backups
+  - Intermediate storage for state handoff during controlled switches (not continuous sync)
+  - Timestamped snapshots for rollback (retain last N)
   - Version history for disaster recovery
 - **Structure**:
   ```
@@ -690,11 +827,13 @@ OpenClawStack.SSHCommand = ssh -i ~/.ssh/openclaw-ec2-key.pem ubuntu@54.123.45.6
 
 ---
 
-## Data Synchronization Strategy
+## State Handoff & Transfer Strategy
 
-### Sync Architecture
+> **Framing note**: This is not a general bidirectional sync system. It is a controlled, scripted, one-direction-at-a-time state handoff between runtimes. There is no conflict resolution, no concurrent writers, and no always-on sync. The sequence is: stop source → copy state → verify → start destination.
 
-**Data to sync for session continuity:**
+### Handoff Data Architecture
+
+**Data to transfer for session continuity:**
 
 1. **OpenClaw Config** (`~/.openclaw/`)
    - `config.json`: Agent configurations, channel settings
@@ -728,9 +867,9 @@ OpenClawStack.SSHCommand = ssh -i ~/.ssh/openclaw-ec2-key.pem ubuntu@54.123.45.6
 - Same personality, same context, same memory ✅
 - Result: Feels like the same agent, just running elsewhere ✅
 
-### Sync Methods
+### Transfer Methods
 
-#### Method 1: Manual Sync Scripts (Recommended for Start)
+#### Method 1: Switch Scripts via S3 (v1 — Recommended)
 
 **Local → Cloud (Before Vacation)**
 ```bash
@@ -938,28 +1077,20 @@ aws s3 sync "$EC2_CONFIG" "s3://$BUCKET_NAME/backups/$TIMESTAMP/openclaw-config/
 echo "Sync complete! Data backed up to S3."
 ```
 
-#### Method 2: Automated Continuous Sync (Advanced)
+#### Method 2: Automated / Continuous Approaches (Future Enhancement — Not v1)
 
-**Option A: Cron-based sync (every 15 minutes)**
-```bash
-# On EC2: /etc/cron.d/openclaw-sync
-*/15 * * * * ubuntu /opt/openclaw/scripts/sync-to-s3.sh >> /var/log/openclaw-sync.log 2>&1
-```
+> **Deferred**: These approaches introduce always-on sync complexity that is not needed at this stage. The single active runtime model makes continuous sync unnecessary — state is only transferred during a controlled switch. Revisit if real operational pain justifies it.
 
-**Option B: S3 Event Notifications + Lambda (Real-time)**
-- S3 triggers Lambda on file changes
-- Lambda notifies EC2 via SNS/SQS
-- EC2 pulls latest changes
-- More complex, but near real-time sync
+**Deferred options (do not build yet):**
+- Cron-based periodic backup to S3 (only while primary runtime is active — safe as a pure backup, not a sync)
+- S3 Event Notifications + Lambda for real-time propagation
+- AWS DataSync managed service
 
-**Option C: AWS DataSync (Managed Service)**
-- AWS-managed sync between EC2 and S3
-- Scheduled or on-demand
-- More expensive but fully managed
+**What IS acceptable in v1**: a cron job on the active side that creates a periodic **backup snapshot** to S3 for disaster recovery purposes only (not for switching).
 
-### Sync Workflow Examples
+### Switch Workflow Examples
 
-#### Scenario 1: Going on Vacation (Local → Cloud)
+#### Scenario 1: Switch to Cloud (Local → Cloud)
 
 ```bash
 # 1. On local machine: Push latest data to S3
@@ -985,7 +1116,7 @@ docker compose stop openclaw-gateway
 # Done! Now using cloud agent
 ```
 
-#### Scenario 2: Returning from Vacation (Cloud → Local)
+#### Scenario 2: Switch to Local (Cloud → Local)
 
 ```bash
 # 1. SSH to EC2: Push latest data to S3
@@ -1009,7 +1140,7 @@ aws ec2 stop-instances --instance-ids i-1234567890abcdef0
 # Done! Now using local agent
 ```
 
-#### Scenario 3: Emergency Access (Use Cloud While Local is Running)
+#### Scenario 3: Emergency Handoff (Cloud While Local Must Stop)
 
 ```bash
 # 1. On local machine: Push latest data to S3
@@ -1034,22 +1165,24 @@ docker compose stop openclaw-gateway
 
 ### Ensuring Session Continuity
 
-**The Golden Rule**: **NEVER run both agents simultaneously**
+**Top-level invariant**: **NEVER run both agents simultaneously — this is a hard constraint, not a guideline.**
 
-Running local and cloud agents at the same time will cause:
+Running local and cloud agents at the same time violates the single-writer assumption and will cause:
 - ❌ Divergent conversation histories
 - ❌ Duplicate message processing
 - ❌ Conflicting state updates
 - ❌ Agent "forgetting" conversations from the other environment
 - ❌ Potential data corruption
 
-**Correct workflow:**
-1. ✅ Stop local agent: `docker compose stop openclaw-gateway`
-2. ✅ Sync local → S3: `./sync-to-cloud.sh`
-3. ✅ Sync S3 → EC2: `ssh ec2 && ./sync-from-s3.sh`
-4. ✅ Start cloud agent: `docker compose up -d`
-5. ✅ Use cloud agent exclusively
-6. ✅ When switching back, reverse the process
+The switch script enforces this: it will not start the destination runtime unless it can confirm the source is stopped.
+
+**Correct workflow (enforced by script):**
+1. ✅ Stop source agent (source must be fully stopped before transfer begins)
+2. ✅ Snapshot + transfer state → S3 → destination
+3. ✅ Verify checksums / file counts
+4. ✅ Start destination agent
+5. ✅ Health check passes → switch is complete
+6. ✅ When switching back, reverse the process with same guarantees
 
 **Session continuity checklist:**
 - [ ] Synced `~/.openclaw/sessions/` (active conversations)
@@ -1073,31 +1206,31 @@ ls -la ~/.openclaw/sessions/
 find ~/.openclaw -name "*.jsonl" -mtime -1
 ```
 
-### Conflict Resolution
+### Conflict Handling (v1 Model: Abort, Not Merge)
 
-**Problem**: What if data changes on both local and cloud?
+**v1 design principle**: there are no concurrent writers, so conflicts should not occur. If the switch script detects unexpected changes on the destination (i.e., files modified after the last known switch), it **aborts** rather than attempting to merge.
 
-**Solution**: Last-write-wins with manual conflict resolution
-1. Always sync **before** switching environments (critical!)
-2. Never run both agents simultaneously (prevents divergence)
-3. Use timestamped backups in S3 to recover if needed
-4. For critical files (`user.md`, `soul.md`), consider version control:
-   ```bash
-   cd ~/.openclaw/agents/your-agent-id/
-   git init
-   git add user.md soul.md sessions/
-   git commit -m "Backup before sync"
-   ```
+**Why abort instead of merge:**
+- The single-active-runtime invariant means legitimate conflicts cannot happen in normal operation
+- If a conflict IS detected, it means a procedure violation occurred (both agents ran simultaneously, or a manual change was made)
+- Merging in this situation risks silently losing data — aborting forces a conscious decision
 
-**If you accidentally ran both agents:**
+**v1 conflict response:**
+1. Script detects unexpected destination changes → exits with error, destination stays stopped
+2. Operator reviews what changed on destination
+3. Operator manually decides: keep source state or destination state (not both)
+4. Restore from the chosen snapshot and proceed
+
+**No conflict merge logic will be built in v1.** If merge tooling becomes necessary, that is a future enhancement triggered by real operational need.
+
+**If both agents were accidentally run simultaneously:**
 1. Stop both agents immediately
-2. Decide which environment has the "source of truth"
-3. Sync from that environment to S3
-4. Restore the other environment from S3
-5. Manually review conversation history for gaps
-6. Consider restoring from timestamped backup if needed
+2. Do NOT attempt to merge — treat the destination state as corrupted
+3. Identify which environment has the most recent valid state
+4. Restore only from that environment's snapshot
+5. Review conversation history for gaps manually if needed
 
-### Data Sync Checklist
+### Switch Checklist
 
 **Before switching to cloud:**
 - [ ] Commit any local changes to git (for `oc-ext-*` files)
@@ -1481,13 +1614,13 @@ find ~/.openclaw -name "*.jsonl" -mtime -1
 
 ### Phase 8: Ongoing Operations
 
-- [ ] **Set up automated backups on EC2** (cron)
+- [ ] **Set up automated backups on EC2** (cron — disaster recovery only, active side)
   ```bash
   # On EC2
   sudo crontab -e -u ubuntu
   
-  # Add: Sync to S3 every 6 hours
-  0 */6 * * * /opt/openclaw/scripts/sync-to-s3.sh >> /var/log/openclaw-sync.log 2>&1
+  # Add: Backup to S3 every 6 hours (backup only, not a sync — only runs on the active side)
+  0 */6 * * * /opt/openclaw/scripts/sync-to-s3.sh >> /var/log/openclaw-backup.log 2>&1
   ```
 
 - [ ] **Monitor EC2 instance**
@@ -1515,11 +1648,13 @@ find ~/.openclaw -name "*.jsonl" -mtime -1
 
 1. **Development stays local**: Code, build, test all on your machine
 2. **Cloud is runtime-only**: No build tools, no repo clone needed on EC2
-3. **Code updates without rebuild**: Push to GitHub → restart container → auto-pulls latest (via git-pull-on-start)
-4. **Image updates**: Rebuild locally → push to registry → pull on EC2 (only when adding apps or changing Dockerfile)
-5. **Platform portability**: Same setup works on local, cloud, Raspberry Pi
-6. **No upstream conflicts**: `oc-ext-` prefix keeps your changes separate
-7. **Multi-app support**: Add more apps by cloning into `/myapps/` (in Dockerfile, built locally)
+3. **Image version = code version**: Built apps always match the image tag; no runtime code mutation for built artifacts
+4. **Script/config updates without rebuild**: Push to GitHub → restart container → auto-pulls (for non-built repos only)
+5. **Image updates**: Rebuild locally → push to registry → pull on EC2 (for built apps and Dockerfile changes)
+6. **Platform portability**: Same setup works on local, cloud, Raspberry Pi
+7. **No upstream conflicts**: `oc-ext-` prefix keeps your changes separate from OpenClaw core
+8. **Multi-app support**: Add more apps by cloning into `/myapps/` (in Dockerfile, built locally)
+9. **Single active runtime**: Controlled handoff model eliminates state divergence risk
 
 ---
 
@@ -1794,13 +1929,15 @@ find "$CONFIG_DIR" -name "*.lock" -delete
    - Develop code locally
    - Test locally
    - Push to GitHub
-   - Cloud auto-pulls on restart (no rebuild needed)
-   - Only rebuild image when adding new apps to `/myapps/` or changing Dockerfile
+   - **Built apps** (task-manager, Next.js): rebuild image → push to registry → pull on cloud
+   - **Script/config repos**: cloud auto-pulls on restart (no rebuild needed)
+   - Rebuild image when: adding new apps to `/myapps/`, changing Dockerfile, changing build output
 
 7. **Establish routine**
-   - Before vacation: Build image locally → push to registry → `sync-to-cloud.sh` → start EC2
-   - After vacation: `sync-from-cloud.sh` → stop EC2
-   - Weekly: Review S3 backups
+   - Before switching to cloud: Build image locally → push to registry → run switch script (stop local → transfer state → start EC2)
+   - Before switching to local: Run switch script (stop EC2 → transfer state → start local)
+   - Active side: Periodic backup cron job to S3 (disaster recovery)
+   - Weekly: Review S3 backup snapshots
    - Monthly: Review AWS costs
 
 8. **Optimize and iterate**
@@ -1815,40 +1952,43 @@ find "$CONFIG_DIR" -name "*.lock" -delete
 
 ### What You've Built
 
-A **production-ready, hybrid local-cloud AI agent deployment framework** that:
+A **hybrid local-cloud AI agent deployment framework** that:
 - ✅ Extends OpenClaw without upstream conflicts (`oc-ext-` prefix)
 - ✅ Supports multiple custom applications (`/myapps/*`)
-- ✅ Auto-updates code on container restart (git pull)
+- ✅ Auto-updates non-built scripts/configs on container restart (git pull, scoped)
 - ✅ Works on local machine, AWS EC2, or any Docker host
-- ✅ Provides seamless data sync between local and cloud (S3)
+- ✅ Provides controlled state handoff between local and cloud (single active runtime)
 - ✅ Uses Infrastructure as Code (AWS CDK) for reproducible deployments
 - ✅ Securely manages secrets (AWS Secrets Manager)
 - ✅ Enables flexible usage: local primary, cloud backup, or hybrid
+- ✅ Enforces single-writer model to eliminate state divergence risk
 
 ### Key Advantages
 
 1. **Session Continuity**: Agent remembers ALL conversations across local/cloud switches ✅
    - Same personality, same memory, same context
    - Feels like talking to the same agent, not a fresh instance
-   - Full conversation history preserved
-   
-2. **No vendor lock-in**: Docker-based, portable to any cloud or on-prem
+   - Full conversation history preserved via controlled state handoff
 
-3. **Cost-effective**: Pay only when cloud agent is running (~$40/month or less)
+2. **Single-writer correctness**: Hard constraint of one active runtime eliminates state divergence by design
 
-4. **Data sovereignty**: Full control over data, stored in your AWS account
+3. **Upstream compatibility**: Extension-only strategy (no OpenClaw fork) preserves upgradeability and future migration flexibility
 
-5. **Disaster recovery**: Automated backups to S3 with versioning
+4. **No vendor lock-in**: Docker-based, portable to any cloud or on-prem
 
-6. **Flexibility**: Switch between local and cloud in minutes
+5. **Cost-effective**: Pay only when cloud agent is running (~$40/month or less)
 
-7. **Scalability**: Easy to add more apps to `/myapps/` or scale EC2 instance
+6. **Data sovereignty**: Full control over data, stored in your AWS account
+
+7. **Rollback safety**: Timestamped snapshots (last N retained) provide a clear rollback path
+
+8. **Scalability**: Easy to add more apps to `/myapps/` or scale EC2 instance
 
 ### Migration Complexity
 
 - **Infrastructure**: Medium (CDK setup, 2-3 hours first time)
-- **Data Sync**: Low (simple bash scripts + AWS CLI)
-- **Ongoing Operations**: Low (mostly automated, occasional manual sync)
+- **State Handoff**: Low (single switch script + AWS CLI, no continuous sync needed)
+- **Ongoing Operations**: Low (switch script for transitions, backup cron on active side)
 - **Cost**: Low (~$10-15/month average for hybrid usage)
 
 ### Next Milestone
@@ -1858,10 +1998,11 @@ A **production-ready, hybrid local-cloud AI agent deployment framework** that:
 **Success Criteria**:
 - [ ] CDK stack deployed
 - [ ] EC2 instance running OpenClaw
-- [ ] Data synced from local to cloud
+- [ ] Switch script: local stopped → state transferred → cloud started (with checksums verified)
 - [ ] Agent responds to messages from cloud
-- [ ] Data synced back from cloud to local
+- [ ] Switch script: cloud stopped → state transferred → local started (with checksums verified)
 - [ ] No data loss or corruption
+- [ ] Health checks pass on both sides after each switch
 
 **Timeline**: 1-2 weeks (assuming 2-3 hours per day)
 
@@ -1934,9 +2075,9 @@ If the agent remembers correctly, session continuity is working! ✅
 
 ---
 
-## Quick Reference: Sync Workflows
+## Quick Reference: Switch Workflows
 
-### Workflow 1: Switch to Cloud (Before Vacation)
+### Workflow 1: Switch to Cloud
 
 ```mermaid
 sequenceDiagram
@@ -1944,19 +2085,21 @@ sequenceDiagram
     participant S3 as S3 Bucket
     participant EC2 as EC2 Instance
     
-    Note over Local: 1. Backup & Sync
+    Note over Local: 1. Stop + Snapshot (both runtimes must be down during transfer)
     Local->>Local: docker compose stop
-    Local->>S3: sync-to-cloud.sh<br/>(push data)
+    Local->>Local: Create timestamped snapshot + manifest
+    Local->>S3: sync-to-cloud.sh (push state)
     
-    Note over EC2: 2. Pull & Start
-    EC2->>S3: sync-from-s3.sh<br/>(pull data)
+    Note over EC2: 2. Verify + Start
+    EC2->>S3: sync-from-s3.sh (pull state)
+    EC2->>EC2: Verify checksums + version compatibility
     EC2->>EC2: docker compose up -d
-    EC2->>EC2: Verify services running
+    EC2->>EC2: Health check + smoke test
     
-    Note over Local,EC2: 3. Cloud is now primary
+    Note over Local,EC2: 3. Cloud is now primary (only one active)
 ```
 
-### Workflow 2: Switch to Local (After Vacation)
+### Workflow 2: Switch to Local
 
 ```mermaid
 sequenceDiagram
@@ -1964,35 +2107,36 @@ sequenceDiagram
     participant S3 as S3 Bucket
     participant Local as Local Machine
     
-    Note over EC2: 1. Backup & Stop
-    EC2->>S3: sync-to-s3.sh<br/>(push data)
+    Note over EC2: 1. Stop + Snapshot (both runtimes must be down during transfer)
+    EC2->>S3: sync-to-s3.sh (push state)
     EC2->>EC2: docker compose stop
-    EC2->>EC2: (Optional) Stop instance
+    EC2->>EC2: (Optional) Stop EC2 instance
     
-    Note over Local: 2. Pull & Start
-    Local->>S3: sync-from-cloud.sh<br/>(pull data)
+    Note over Local: 2. Verify + Start
+    Local->>S3: sync-from-cloud.sh (pull state)
+    Local->>Local: Verify checksums + version compatibility
     Local->>Local: docker compose up -d
-    Local->>Local: Verify services running
+    Local->>Local: Health check + smoke test
     
-    Note over Local,EC2: 3. Local is now primary
+    Note over Local,EC2: 3. Local is now primary (only one active)
 ```
 
-### Workflow 3: Continuous Backup (Automated)
+### Workflow 3: Periodic Backup (Disaster Recovery Only — Active Side)
 
 ```mermaid
 graph LR
-    subgraph primary [Primary Agent]
-        agent[OpenClaw Agent<br/>Local or Cloud]
+    subgraph primary [Active Runtime Only]
+        agent[OpenClaw Agent<br/>Local OR Cloud - never both]
     end
     
-    subgraph backup [Automated Backup]
-        cron[Cron Job<br/>Every 6 hours]
-        script[sync-to-s3.sh]
+    subgraph backup [Disaster Recovery Backup]
+        cron[Cron Job<br/>Every 6 hours - active side only]
+        script[backup-to-s3.sh]
     end
     
     subgraph storage [S3 Storage]
-        current[Current Data]
-        versioned[Versioned Backups]
+        current[Current Snapshot]
+        versioned[Timestamped Backups<br/>Retain last N]
         archived[Archived Glacier]
     end
     
@@ -2003,7 +2147,9 @@ graph LR
     versioned -->|90 days| archived
 ```
 
-### Session Continuity: What Gets Synced
+> **Note**: This backup runs only on the active runtime side and is for disaster recovery only. It is not a sync mechanism — it does not flow state to the inactive side.
+
+### Session Continuity: What Gets Transferred
 
 ```mermaid
 graph TB
