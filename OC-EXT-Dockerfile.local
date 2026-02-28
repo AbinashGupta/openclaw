@@ -11,7 +11,8 @@ RUN apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       ffmpeg \
       python3-pip \
-      git && \
+      git \
+      jq && \
     pip3 install --break-system-packages --no-cache-dir -U openai-whisper && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
@@ -53,7 +54,7 @@ RUN printf '%s\n' \
   '# Run gateway from /app (docker-compose command or default)' \
   'cd /app' \
   'if [ $# -eq 0 ]; then' \
-  '  exec node /app/dist/index.js gateway --allow-unconfigured' \
+  '  exec node /app/dist/index.js gateway --allow-unconfigured --bind lan' \
   'else' \
   '  shift 2' \
   '  exec node /app/dist/index.js "$@"' \
