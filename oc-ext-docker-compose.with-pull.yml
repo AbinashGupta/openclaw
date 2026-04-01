@@ -1,0 +1,19 @@
+# Compose override for git-pull-on-start. Use with the openclaw repo compose:
+#   OPENCLAW_IMAGE=openclaw:local-whisper \
+#   docker compose -f docker-compose.yml -f oc-ext-docker-compose.with-pull.yml up -d
+#
+# Requires: build the image from OC-EXT-Dockerfile.local:
+#   docker build -t openclaw:local-whisper -f OC-EXT-Dockerfile.local .
+#
+# Note: No /app mount needed. The entrypoint pulls repos from /myapps/* inside the container.
+
+services:
+  openclaw-gateway:
+    image: ${OPENCLAW_IMAGE:?Set OPENCLAW_IMAGE e.g. openclaw:local-whisper}
+    ports:
+      - "3847:3847"  # Expose task-manager port
+    volumes:
+      - ${OPENCLAW_CONFIG_DIR}/task-manager-data:/myapps/task-manager/data
+  openclaw-cli:
+    image: ${OPENCLAW_IMAGE:?Set OPENCLAW_IMAGE e.g. openclaw:local-whisper}
+    command: ["node", "dist/index.js"]
